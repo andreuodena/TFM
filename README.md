@@ -1,7 +1,7 @@
 # TFM reproducible R analyses
 
 This directory contains the R code used to generate the processed data and
-statistical results presented in the TFM figures. It also contains a pdf fiel containing the supplementary figure 1.
+statistical results presented in the TFM figures. It also contains a pdf file containing the supplementary figure 1.
 
 ## First analysis: bulk RNA-seq preprocessing
 
