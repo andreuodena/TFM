@@ -1,0 +1,299 @@
+---
+title: "Bulk RNA-seq preprocessing and quality control"
+author: "Andreu Odena"
+date: "2026-08-24"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  dev = "svg",
+  fig.align = "center"
+)
+```
+
+# Objective
+
+This analysis prepares the baseline bulk RNA-seq expression matrix used in the study.
+It performs sample-level quality control, removes genes with low counts, applies TMM normalization and generates a log2-CPM matrix for downstream analyses.
+
+It generates supplementary quality-control figures:
+
+1. Library size for each PDX model
+2. Clinicopathological-subtype composition within each sequencing batch
+3. PCA of the normalized expression profiles.
+
+# Packages and input files
+
+The analysis should be run from the root of the GitHub repository. Raw data are
+expected in the local `data` directory and are not included in the public
+repository.
+
+```{r packages-and-paths}
+library(edgeR)
+library(ggplot2)
+
+counts_path <- file.path("data", "260824_Counts.csv")
+metadata_path <- file.path("data", "260824_Metadata.csv")
+figure_dir <- file.path("figures", "supplementary_RNAseq_QC")
+
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load the data
+
+```{r load-data}
+counts_input <- read.csv(
+  counts_path,
+  sep = ";",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+metadata <- read.csv(
+  metadata_path,
+  sep = ";",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8-BOM"
+)
+
+gene_names <- trimws(as.character(counts_input$gene_name))
+counts_matrix <- as.matrix(counts_input[, -1, drop = FALSE])
+storage.mode(counts_matrix) <- "numeric"
+rownames(counts_matrix) <- gene_names
+
+metadata$samples <- trimws(as.character(metadata$samples))
+
+# Reorder the metadata to match the count-matrix columns exactly.
+metadata <- metadata[
+  match(colnames(counts_matrix), metadata$samples),
+  ,
+  drop = FALSE
+]
+
+metadata$Batch <- factor(metadata$Batch)
+metadata$Subtype_2 <- factor(
+  metadata$Subtype_2,
+  levels = c("ER+/HER2-", "ER+/HER2+", "TNBC")
+)
+
+cat("Raw count-matrix dimensions:", dim(counts_matrix), "\n")
+cat("Number of PDX models:", ncol(counts_matrix), "\n")
+```
+
+# Sample-level exploration
+
+## Library size
+
+Library size was calculated as the total number of mapped reads assigned to genes in each sample before expression filtering.
+
+```{r library-size, fig.width=7, fig.height=11}
+library_size_df <- data.frame(
+  sample = colnames(counts_matrix),
+  library_size_million = colSums(counts_matrix) / 1e6,
+  Batch = metadata$Batch,
+  Subtype = metadata$Subtype_2,
+  stringsAsFactors = FALSE
+)
+
+library_size_df <- library_size_df[
+  order(library_size_df$library_size_million),
+  ,
+  drop = FALSE
+]
+
+library_size_df$sample <- factor(
+  library_size_df$sample,
+  levels = library_size_df$sample
+)
+
+batch_colours <- c(
+  "SERRAVIO_03" = "#4C72B0",
+  "SERRAVIO_04" = "#DD8452",
+  "SERRAVIO_09" = "#55A868"
+)
+
+p_library_size <- ggplot(
+  library_size_df,
+  aes(x = sample, y = library_size_million, fill = Batch)
+) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = batch_colours) +
+  labs(
+    x = NULL,
+    y = "Library size (million reads)",
+    fill = "Sequencing batch"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.y = element_text(size = 5))
+
+p_library_size
+
+ggsave(
+  file.path(figure_dir, "Figure_library_size.svg"),
+  p_library_size,
+  width = 7,
+  height = 11
+)
+```
+
+## Subtype composition by sequencing batch
+
+This plot checks whether the proportions of the main clinicopathological subtypes differ across RNA-sequencing batches.
+
+```{r batch-subtype-composition, fig.width=7, fig.height=5}
+batch_subtype_df <- as.data.frame(
+  table(
+    Batch = metadata$Batch,
+    Subtype = metadata$Subtype_2
+  )
+)
+
+colnames(batch_subtype_df)[3] <- "n_models"
+
+subtype_colours <- c(
+  "ER+/HER2-" = "#4C72B0",
+  "ER+/HER2+" = "#C65CCB",
+  "TNBC" = "#F8766D"
+)
+
+p_batch_subtype <- ggplot(
+  batch_subtype_df,
+  aes(x = Batch, y = n_models, fill = Subtype)
+) +
+  geom_col(
+    position = "fill",
+    colour = "white",
+    linewidth = 0.3
+  ) +
+  scale_y_continuous(
+    labels = function(x) paste0(round(100 * x), "%")
+  ) +
+  scale_fill_manual(values = subtype_colours, drop = FALSE) +
+  labs(
+    x = "Sequencing batch",
+    y = "Proportion of PDX models",
+    fill = "Clinicopathological subtype"
+  ) +
+  theme_classic(base_size = 11)
+
+p_batch_subtype
+
+ggsave(
+  file.path(figure_dir, "Figure_batch_subtype_composition.svg"),
+  p_batch_subtype,
+  width = 7,
+  height = 5
+)
+```
+
+# Low-expression filtering
+
+Following the procedure used in class, genes were retained when they had more
+than 10 reads in at least 15 PDX models. The threshold of 15 models was fixed
+before downstream analysis and corresponds to approximately 19% of the 79-model cohort.
+
+```{r expression-filtering}
+minimum_count <- 10
+minimum_samples <- 15
+
+keep_gene <- rowSums(counts_matrix > minimum_count) >= minimum_samples
+counts_filtered <- counts_matrix[keep_gene, , drop = FALSE]
+
+cat("Genes before filtering:", nrow(counts_matrix), "\n")
+cat("Genes after filtering:", nrow(counts_filtered), "\n")
+```
+
+# TMM normalisation
+
+TMM normalisation was performed with `edgeR` to account for differences in
+library composition. Normalised log2 counts per million were then calculated
+for visualisation and downstream sample-level analyses.
+
+```{r tmm-normalisation}
+dge <- DGEList(counts = counts_filtered)
+dge <- calcNormFactors(dge, method = "TMM")
+
+expression_log2cpm <- cpm(
+  dge,
+  log = TRUE,
+  prior.count = 1
+)
+
+```
+
+# PCA
+
+PCA was performed on the transposed TMM-normalised log2-CPM matrix. Genes were
+centred and scaled. The analysis is unsupervised and was not batch-corrected; batch and subtype were used only as plot annotations.
+
+```{r pca, fig.width=8, fig.height=6}
+pca_result <- prcomp(
+  t(expression_log2cpm),
+  center = TRUE,
+  scale. = TRUE
+)
+
+variance_explained <- 100 * (
+  pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+pca_df <- data.frame(
+  sample = rownames(pca_result$x),
+  PC1 = pca_result$x[, "PC1"],
+  PC2 = pca_result$x[, "PC2"],
+  Batch = metadata$Batch,
+  Subtype = metadata$Subtype_2,
+  stringsAsFactors = FALSE
+)
+
+p_pca <- ggplot(
+  pca_df,
+  aes(
+    x = PC1,
+    y = PC2,
+    colour = Subtype,
+    shape = Batch
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  scale_colour_manual(values = subtype_colours, drop = FALSE) +
+  scale_shape_manual(
+    values = c(
+      "SERRAVIO_03" = 16,
+      "SERRAVIO_04" = 17,
+      "SERRAVIO_09" = 15
+    )
+  ) +
+  labs(
+    x = paste0("PC1 (", round(variance_explained[1], 1), "%)"),
+    y = paste0("PC2 (", round(variance_explained[2], 1), "%)"),
+    colour = "Clinicopathological subtype",
+    shape = "Sequencing batch"
+  ) +
+  theme_classic(base_size = 11)
+
+p_pca
+
+ggsave(
+  file.path(figure_dir, "Figure_PCA_subtype_batch.svg"),
+  p_pca,
+  width = 8,
+  height = 6
+)
+```
+
+# Reproducibility information
+
+```{r session-information}
+sessionInfo()
+```

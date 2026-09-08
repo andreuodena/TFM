@@ -1,0 +1,18 @@
+# Raw or potentially sensitive input data
+data/*.csv
+data/*.tsv
+data/*.xls
+data/*.xlsx
+
+# Reproducible outputs
+results/
+figures/
+
+# Rendered documents and R session files
+*.html
+*.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+!data/README.md

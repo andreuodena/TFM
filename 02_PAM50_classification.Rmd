@@ -1,0 +1,449 @@
+---
+title: "PAM50 intrinsic-subtype classification"
+author: "Andreu Odena"
+date: "2026-09-08"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  dev = "svg",
+  fig.align = "center"
+)
+```
+
+# Objective
+
+This analysis assigns a PAM50 intrinsic subtype to each baseline PDX model from
+TMM-normalised bulk RNA-seq expression. The Parker PAM50 classification is used
+as the principal subtype call, while the `genefu.scale` result is retained as a
+complementary classification. The analysis also generates a supplementary PCA
+coloured by the calculated PAM50 subtype and shaped by sequencing batch.
+
+# Packages and paths
+
+```{r packages-and-paths}
+library(edgeR)
+library(BreastSubtypeR)
+library(SummarizedExperiment)
+library(S4Vectors)
+library(ggplot2)
+
+counts_path <- file.path("data", "260824_Counts.csv")
+metadata_path <- file.path("data", "260824_Metadata.csv")
+
+results_dir <- file.path("results", "PAM50")
+figure_dir <- file.path("figures", "supplementary_PAM50")
+
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load and preprocess the RNA-seq data
+
+Genes were retained when they had more than 10 reads in at least 15 PDX models.
+TMM normalisation and log2-CPM transformation were performed with `edgeR`, using
+the same preprocessing settings as the main bulk RNA-seq analysis.
+
+```{r load-and-normalise-data}
+counts_input <- read.csv(
+  counts_path,
+  sep = ";",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+metadata <- read.csv(
+  metadata_path,
+  sep = ";",
+  check.names = FALSE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8-BOM"
+)
+
+gene_names <- trimws(as.character(counts_input$gene_name))
+counts_matrix <- as.matrix(counts_input[, -1, drop = FALSE])
+storage.mode(counts_matrix) <- "numeric"
+rownames(counts_matrix) <- gene_names
+
+metadata$samples <- trimws(as.character(metadata$samples))
+metadata <- metadata[
+  match(colnames(counts_matrix), metadata$samples),
+  ,
+  drop = FALSE
+]
+
+keep_gene <- rowSums(counts_matrix > 10) >= 15
+counts_filtered <- counts_matrix[keep_gene, , drop = FALSE]
+
+dge <- DGEList(counts = counts_filtered)
+dge <- calcNormFactors(dge, method = "TMM")
+
+expression_log2cpm <- cpm(
+  dge,
+  log = TRUE,
+  prior.count = 1
+)
+```
+
+# Map gene symbols to Entrez identifiers
+
+`BreastSubtypeR` requires expression features annotated with gene symbol and
+Entrez identifier. When several expression features map to the same PAM50
+feature, the feature with the highest expression is retained by the package
+mapping procedure.
+
+```{r gene-annotation}
+data("Gene.ID.ann", package = "BreastSubtypeR")
+
+gene_symbols <- trimws(rownames(expression_log2cpm))
+annotation_symbols <- trimws(as.character(Gene.ID.ann$HGNC))
+annotation_entrez <- trimws(as.character(Gene.ID.ann$EntrezGene))
+
+gene_match <- match(
+  toupper(gene_symbols),
+  toupper(annotation_symbols)
+)
+
+entrez_ids <- annotation_entrez[gene_match]
+valid_genes <- !is.na(entrez_ids) & entrez_ids != ""
+
+expression_for_pam50 <- expression_log2cpm[
+  valid_genes,
+  ,
+  drop = FALSE
+]
+
+gene_symbols <- gene_symbols[valid_genes]
+entrez_ids <- entrez_ids[valid_genes]
+
+feature_row_names <- make.unique(gene_symbols)
+rownames(expression_for_pam50) <- feature_row_names
+
+row_annotation <- S4Vectors::DataFrame(
+  probe = gene_symbols,
+  SYMBOL = gene_symbols,
+  ENTREZID = entrez_ids,
+  row.names = feature_row_names
+)
+```
+
+# Create the annotated expression object
+
+Each PDX model is treated as an independent sample. Clinicopathological subtype
+and sequencing batch are retained as sample annotations but are not used to
+assign the PAM50 subtype.
+
+```{r annotated-expression-object}
+col_annotation <- S4Vectors::DataFrame(
+  PatientID = metadata$samples,
+  samples = metadata$samples,
+  Batch = as.character(metadata$Batch),
+  Subtype_2 = as.character(metadata$Subtype_2),
+  ER = ifelse(
+    metadata$Subtype_2 %in% c("ER+/HER2-", "ER+/HER2+"),
+    "ER+",
+    "ER-"
+  ),
+  HER2 = ifelse(
+    metadata$Subtype_2 == "ER+/HER2+",
+    "HER2+",
+    "HER2-"
+  ),
+  TN = ifelse(
+    metadata$Subtype_2 == "TNBC",
+    "TN",
+    "nonTN"
+  ),
+  row.names = metadata$samples
+)
+
+se_object <- SummarizedExperiment::SummarizedExperiment(
+  assays = list(
+    counts = as.matrix(expression_for_pam50)
+  ),
+  rowData = row_annotation,
+  colData = col_annotation
+)
+```
+
+# PAM50 classification
+
+The TMM-normalised log2-CPM matrix is mapped to the PAM50 features and classified
+using the Parker original and `genefu.scale` methods implemented in
+`BreastSubtypeR`.
+
+```{r pam50-classification}
+pam50_input <- BreastSubtypeR::Mapping(
+  se_obj = se_object,
+  RawCounts = FALSE,
+  method = "max",
+  impute = TRUE,
+  verbose = TRUE
+)
+
+pam50_result <- BreastSubtypeR::BS_Multi(
+  data_input = pam50_input,
+  methods = c("parker.original", "genefu.scale"),
+  Subtype = FALSE,
+  hasClinical = FALSE
+)
+
+pam50_calls <- as.data.frame(pam50_result$res_subtypes)
+pam50_calls$samples <- rownames(pam50_calls)
+
+colnames(pam50_calls)[
+  colnames(pam50_calls) == "parker.original"
+] <- "PAM50_Parker"
+
+colnames(pam50_calls)[
+  colnames(pam50_calls) == "genefu.scale"
+] <- "PAM50_Genefu_scale"
+
+pam50_label_map <- c(
+  "LumA" = "Luminal A",
+  "LumB" = "Luminal B",
+  "Her2" = "HER2-enriched",
+  "Basal" = "Basal-like",
+  "Normal" = "Normal-like"
+)
+
+pam50_calls$PAM50_label <- unname(
+  pam50_label_map[
+    as.character(pam50_calls$PAM50_Parker)
+  ]
+)
+
+pam50_calls <- merge(
+  metadata[, c("samples", "Batch", "Subtype_2")],
+  pam50_calls,
+  by = "samples",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+pam50_calls <- pam50_calls[
+  match(metadata$samples, pam50_calls$samples),
+  ,
+  drop = FALSE
+]
+
+write.csv(
+  pam50_calls,
+  file.path(results_dir, "PAM50_Parker_calls.csv"),
+  row.names = FALSE,
+  quote = TRUE
+)
+```
+
+# PAM50-gene expression matrix
+
+The TMM-normalised expression values for the PAM50 signature genes are exported
+for the cohort heatmap and other downstream visualisations.
+
+```{r pam50-expression-matrix}
+data("BreastSubtypeRobj", package = "BreastSubtypeR")
+
+pam50_signature <- BreastSubtypeRobj$genes.sig50
+
+character_columns <- colnames(pam50_signature)[
+  vapply(
+    pam50_signature,
+    function(current_column) {
+      is.character(current_column) || is.factor(current_column)
+    },
+    logical(1)
+  )
+]
+
+signature_overlap <- vapply(
+  character_columns,
+  function(current_column) {
+    sum(
+      toupper(as.character(
+        pam50_signature[[current_column]]
+      )) %in% toupper(gene_symbols)
+    )
+  },
+  numeric(1)
+)
+
+pam50_gene_column <- character_columns[
+  which.max(signature_overlap)
+]
+
+pam50_genes <- unique(
+  toupper(as.character(
+    pam50_signature[[pam50_gene_column]]
+  ))
+)
+
+pam50_gene_indices <- which(
+  toupper(gene_symbols) %in% pam50_genes
+)
+
+pam50_expression <- expression_for_pam50[
+  pam50_gene_indices,
+  ,
+  drop = FALSE
+]
+
+write.csv(
+  data.frame(
+    gene_name = gene_symbols[pam50_gene_indices],
+    pam50_expression,
+    check.names = FALSE
+  ),
+  file.path(results_dir, "PAM50_expression_log2CPM.csv"),
+  row.names = FALSE,
+  quote = TRUE
+)
+```
+
+# PCA annotated by PAM50 intrinsic subtype
+
+PCA is performed using the 500 genes with the highest variance across the
+TMM-normalised cohort. The calculated Parker PAM50 subtype is used only as a
+colour annotation and sequencing batch is represented by point shape.
+
+```{r pam50-pca, fig.width=8.5, fig.height=6.2}
+gene_variance <- apply(
+  expression_log2cpm,
+  1,
+  var,
+  na.rm = TRUE
+)
+
+top_variable_genes <- names(
+  sort(gene_variance, decreasing = TRUE)
+)[seq_len(500)]
+
+pca_expression <- expression_log2cpm[
+  top_variable_genes,
+  ,
+  drop = FALSE
+]
+
+pca_result <- prcomp(
+  t(pca_expression),
+  center = TRUE,
+  scale. = TRUE
+)
+
+explained_variance <- 100 * (
+  pca_result$sdev^2 / sum(pca_result$sdev^2)
+)
+
+pca_data <- data.frame(
+  samples = rownames(pca_result$x),
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  stringsAsFactors = FALSE
+)
+
+pam50_index <- match(
+  pca_data$samples,
+  pam50_calls$samples
+)
+
+metadata_index <- match(
+  pca_data$samples,
+  metadata$samples
+)
+
+pca_data$PAM50_label <- pam50_calls$PAM50_label[
+  pam50_index
+]
+pca_data$Batch <- metadata$Batch[metadata_index]
+
+pam50_order <- c(
+  "Luminal A",
+  "Luminal B",
+  "HER2-enriched",
+  "Basal-like",
+  "Normal-like"
+)
+
+pca_data$PAM50_label <- factor(
+  pca_data$PAM50_label,
+  levels = pam50_order
+)
+
+pam50_colours <- c(
+  "Luminal A" = "#4C78A8",
+  "Luminal B" = "#2A6FBB",
+  "HER2-enriched" = "#B455C5",
+  "Basal-like" = "#D84A4A",
+  "Normal-like" = "#7A8B8E"
+)
+
+batch_shapes <- c(
+  "SERRAVIO_03" = 16,
+  "SERRAVIO_04" = 17,
+  "SERRAVIO_09" = 15
+)
+
+p_pca_pam50 <- ggplot(
+  pca_data,
+  aes(
+    x = PC1,
+    y = PC2,
+    colour = PAM50_label,
+    shape = Batch
+  )
+) +
+  geom_point(size = 3.2, alpha = 0.9) +
+  scale_colour_manual(
+    values = pam50_colours,
+    breaks = pam50_order,
+    name = "PAM50 intrinsic subtype",
+    drop = FALSE
+  ) +
+  scale_shape_manual(
+    values = batch_shapes,
+    name = "Sequencing batch"
+  ) +
+  labs(
+    x = paste0(
+      "PC1 (",
+      round(explained_variance[1], 1),
+      "%)"
+    ),
+    y = paste0(
+      "PC2 (",
+      round(explained_variance[2], 1),
+      "%)"
+    )
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+p_pca_pam50
+
+ggsave(
+  file.path(
+    figure_dir,
+    "PCA_TMM_log2CPM_by_PAM50.svg"
+  ),
+  p_pca_pam50,
+  width = 8.5,
+  height = 6.2
+)
+```
+
+# Reproducibility information
+
+```{r session-information}
+sessionInfo()
+```
